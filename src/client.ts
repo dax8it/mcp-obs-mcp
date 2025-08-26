@@ -124,11 +124,12 @@ export class OBSWebSocketClient extends EventEmitter {
 
     return new Promise<void>((resolve, reject) => {
       try {
+        logger.log(`Attempting to connect to OBS WebSocket at: ${this.url}`);
         this.ws = new WebSocket(this.url);
 
         this.ws.on('open', () => {
           this.connected = true;
-          logger.log('Connected to OBS WebSocket server');
+          logger.log('WebSocket connection opened successfully');
         });
 
         this.ws.on('message', (data: WebSocket.Data) => {
@@ -140,22 +141,35 @@ export class OBSWebSocketClient extends EventEmitter {
           }
         });
 
-        this.ws.on('close', () => {
+        this.ws.on('close', (code: number, reason: Buffer) => {
           this.connected = false;
           this.identified = false;
-          logger.log('Disconnected from OBS WebSocket server');
+          const reasonStr = reason.toString() || 'No reason provided';
+          logger.log(`WebSocket connection closed with code ${code}: ${reasonStr}`);
           this.emit('disconnected');
 
           // Clear all pending requests
           this.pendingRequests.forEach((request) => {
             clearTimeout(request.timeout);
-            request.reject(new Error('WebSocket connection closed'));
+            request.reject(new Error(`WebSocket connection closed: ${reasonStr}`));
           });
           this.pendingRequests.clear();
         });
 
         this.ws.on('error', (error) => {
-          logger.error(`WebSocket error: ${error instanceof Error ? error.message : String(error)}`);
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logger.error(`WebSocket connection error: ${errorMessage}`);
+          
+          // Provide more specific error information
+          if (errorMessage.includes('ECONNREFUSED')) {
+            logger.error('Connection refused. Make sure OBS Studio is running and WebSocket is enabled.');
+            logger.error('Check that the WebSocket port (default: 4455) is not blocked by firewall.');
+          } else if (errorMessage.includes('ENOTFOUND')) {
+            logger.error('Host not found. Check the OBS_WEBSOCKET_URL environment variable.');
+          } else if (errorMessage.includes('ETIMEDOUT')) {
+            logger.error('Connection timed out. Check network connectivity and firewall settings.');
+          }
+          
           reject(error);
         });
 
@@ -168,10 +182,49 @@ export class OBSWebSocketClient extends EventEmitter {
             reject(error);
           }
         });
+
+        // Set a timeout for the initial connection
+        const connectionTimeout = setTimeout(() => {
+          if (!this.connected) {
+            this.ws?.terminate();
+            reject(new Error('WebSocket connection timeout - OBS may not be running or WebSocket may be disabled'));
+          }
+        }, 5000);
+
+        this.ws.on('open', () => {
+          clearTimeout(connectionTimeout);
+        });
+
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.error(`Failed to create WebSocket connection: ${errorMessage}`);
         reject(error);
       }
     });
+  }
+
+  /**
+   * Check if the client is connected and identified
+   */
+  public isConnected(): boolean {
+    return this.connected && this.identified;
+  }
+
+  /**
+   * Get connection status information
+   */
+  public getConnectionStatus(): {
+    connected: boolean;
+    identified: boolean;
+    url: string;
+    hasPassword: boolean;
+  } {
+    return {
+      connected: this.connected,
+      identified: this.identified,
+      url: this.url,
+      hasPassword: this.password !== null
+    };
   }
 
   /**
@@ -291,17 +344,25 @@ export class OBSWebSocketClient extends EventEmitter {
       throw new Error('Not connected to OBS WebSocket server');
     }
 
+    logger.log(`Received hello from OBS WebSocket v${hello.obsWebSocketVersion} (OBS v${hello.obsStudioVersion})`);
+    logger.log(`RPC Version: ${hello.rpcVersion}`);
+
     let authentication: string | undefined;
 
     // Handle authentication if required
     if (hello.authentication && this.password) {
+      logger.log('Authentication required, generating auth string...');
       authentication = this.generateAuthenticationString(
         this.password,
         hello.authentication.salt,
         hello.authentication.challenge
       );
     } else if (hello.authentication && !this.password) {
-      throw new Error('Password required for authentication but not provided');
+      const errorMsg = 'Password required for authentication but not provided. Set OBS_WEBSOCKET_PASSWORD environment variable.';
+      logger.error(errorMsg);
+      throw new Error(errorMsg);
+    } else if (!hello.authentication) {
+      logger.log('No authentication required');
     }
 
     const identifyMessage: IdentifyMessage = {
@@ -319,18 +380,21 @@ export class OBSWebSocketClient extends EventEmitter {
     return new Promise<void>((resolve, reject) => {
       // Set up a one-time listener for the Identified message
       this.once('identified', () => {
-        logger.log('Identified with OBS WebSocket server');
+        logger.log('Successfully identified with OBS WebSocket server');
         resolve();
       });
 
       // Set a timeout for identification
       const timeoutId = setTimeout(() => {
-        reject(new Error('Identification timed out'));
+        const errorMsg = 'Identification timed out - OBS may be unresponsive or authentication failed';
+        logger.error(errorMsg);
+        reject(new Error(errorMsg));
       }, 5000);
 
       this.once('identified', () => clearTimeout(timeoutId));
 
       // Send the Identify message
+      logger.log('Sending identify message...');
       this.ws!.send(JSON.stringify(identifyMessage));
     });
   }
